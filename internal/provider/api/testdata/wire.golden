@@ -186,6 +186,10 @@
 > GET /management/v1/warehouse [x-project-id: p1]
 < []api.WarehouseListItem [{"ID":"w1","ProjectID":"p1","Name":"wh","Protected":true},{"ID":"w2","ProjectID":"p1","Name":"other","Protected":false}]
 
+## LookupWarehouseID
+> GET /management/v1/warehouse [x-project-id: p1]
+< string "w1"
+
 ## DeleteWarehouse
 > DELETE /management/v1/warehouse/w1?force=false
 
@@ -205,6 +209,27 @@
 ## SetWarehouseProtection
 > POST /management/v1/warehouse/w1/protection
   {"protected":true}
+
+## CreateGenericTable
+> POST /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables [x-project-id: p1]
+  {"base-location":"s3://b/p","doc":"a doc","format":"lance","name":"gt","properties":{"owner":"me"},"schema":{"type":"struct"}}
+> GET /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables [x-project-id: p1]
+< *api.GenericTable {"ID":"g1","Name":"gt","Namespace":["sales","bronze"],"Format":"lance","BaseLocation":"s3://b/p","Doc":"a doc","Properties":{"owner":"me"},"Schema":null,"Protected":false}
+
+## LoadGenericTable
+> GET /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables/gt [x-project-id: p1]
+< *api.GenericTable {"ID":"","Name":"gt","Namespace":["sales","bronze"],"Format":"lance","BaseLocation":"s3://b/p","Doc":"a doc","Properties":{"owner":"me"},"Schema":null,"Protected":false}
+
+## ListGenericTables
+> GET /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables [x-project-id: p1]
+< []api.GenericTable [{"ID":"g1","Name":"gt","Namespace":["sales","bronze"],"Format":"lance","BaseLocation":"","Doc":null,"Properties":null,"Schema":null,"Protected":false}]
+
+## RenameGenericTable
+> POST /lakekeeper/v1/w1/generic-tables/rename [x-project-id: p1]
+  {"destination":{"name":"gt2","namespace":["sales","bronze"]},"source":{"name":"gt","namespace":["sales","bronze"]}}
+
+## DeleteGenericTable
+> DELETE /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables/gt?force=true&purgeRequested=true [x-project-id: p1]
 
 ## UpdateWarehouseDeleteProfile soft
 > POST /management/v1/warehouse/w1/delete-profile

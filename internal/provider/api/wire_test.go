@@ -44,10 +44,14 @@ var wireRoutes = map[string]string{
 	"GET /management/v1/user/oidc~a%2Fb":          userJSON,
 	"GET /management/v1/whoami":                   strings.TrimSuffix(userJSON, "}") + `,"is-instance-admin":false}`,
 	"POST /management/v1/warehouse":               warehouseJSON,
-	"GET /management/v1/warehouse/w1":             warehouseJSON,
 	"GET /management/v1/warehouse":                `{"warehouses":[` + warehouseJSON + `,` + strings.NewReplacer(`"w1"`, `"w2"`, `"wh"`, `"other"`, `"protected":true`, `"protected":false`).Replace(warehouseJSON) + `]}`,
+	"GET /management/v1/warehouse/w1":             warehouseJSON,
 	"POST /management/v1/warehouse/w1/rename":     warehouseJSON,
 	"POST /management/v1/warehouse/w1/protection": `{"protected":true}`,
+
+	"POST /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables":   `{"table":{"name":"gt","format":"lance","base-location":"s3://b/p","doc":"a doc","properties":{"owner":"me"},"protected":false}}`,
+	"GET /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables":    `{"identifiers":[{"namespace":["sales","bronze"],"name":"gt","id":"g1","format":"lance"}]}`,
+	"GET /lakekeeper/v1/w1/namespaces/sales%1Fbronze/generic-tables/gt": `{"table":{"name":"gt","format":"lance","base-location":"s3://b/p","doc":"a doc","properties":{"owner":"me"},"protected":false}}`,
 
 	"GET /management/v1/permissions/server/assignments":       `{"assignments":[{"type":"operator","user":"u1"},{"type":"admin","role":"r1"}]}`,
 	"GET /management/v1/permissions/project/assignments":      `{"project-id":"p1","assignments":[{"type":"project_admin","user":"u1"},{"type":"select","role":"r1"}]}`,
@@ -199,12 +203,35 @@ func TestWire(t *testing.T) {
 	})
 	step("GetWarehouse", func() (any, error) { return c.GetWarehouse(ctx, "p1", "w1") })
 	step("ListWarehouses", func() (any, error) { return c.ListWarehouses(ctx, "p1") })
+	step("LookupWarehouseID", func() (any, error) { return c.LookupWarehouseID(ctx, "p1", "wh") })
 	step("DeleteWarehouse", func() (any, error) { return none(c.DeleteWarehouse(ctx, "p1", "w1", false)) })
 	step("DeleteWarehouse force", func() (any, error) { return none(c.DeleteWarehouse(ctx, "p1", "w1", true)) })
 	step("ActivateWarehouse", func() (any, error) { return none(c.ActivateWarehouse(ctx, "p1", "w1")) })
 	step("DeactivateWarehouse", func() (any, error) { return none(c.DeactivateWarehouse(ctx, "p1", "w1")) })
 	step("RenameWarehouse", func() (any, error) { return none(c.RenameWarehouse(ctx, "p1", "w1", "new")) })
 	step("SetWarehouseProtection", func() (any, error) { return none(c.SetWarehouseProtection(ctx, "p1", "w1", true)) })
+	step("CreateGenericTable", func() (any, error) {
+		return c.CreateGenericTable(ctx, "p1", "w1", []string{"sales", "bronze"}, GenericTableRequest{
+			Name:         "gt",
+			Format:       "lance",
+			BaseLocation: new("s3://b/p"),
+			Doc:          new("a doc"),
+			Properties:   map[string]string{"owner": "me"},
+			Schema:       []byte(`{"type":"struct"}`),
+		})
+	})
+	step("LoadGenericTable", func() (any, error) {
+		return c.LoadGenericTable(ctx, "p1", "w1", []string{"sales", "bronze"}, "gt")
+	})
+	step("ListGenericTables", func() (any, error) {
+		return c.ListGenericTables(ctx, "p1", "w1", []string{"sales", "bronze"})
+	})
+	step("RenameGenericTable", func() (any, error) {
+		return none(c.RenameGenericTable(ctx, "p1", "w1", []string{"sales", "bronze"}, "gt", []string{"sales", "bronze"}, "gt2"))
+	})
+	step("DeleteGenericTable", func() (any, error) {
+		return none(c.DeleteGenericTable(ctx, "p1", "w1", []string{"sales", "bronze"}, "gt", true, true))
+	})
 	step("UpdateWarehouseDeleteProfile soft", func() (any, error) {
 		return none(c.UpdateWarehouseDeleteProfile(ctx, "p1", "w1", DeleteProfile{Type: DeleteProfileTypeSoft, ExpirationSeconds: 600}))
 	})

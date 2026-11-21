@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 
 	managementv1 "github.com/lakekeeper/go-lakekeeper/pkg/apis/management/v1"
 	lakekeeper "github.com/lakekeeper/go-lakekeeper/pkg/client"
@@ -82,6 +83,22 @@ func (c *Client) GetWarehouse(ctx context.Context, projectID, warehouseID string
 		StorageProfile: sp,
 		DeleteProfile:  dp,
 	}, nil
+}
+
+// LookupWarehouseID returns the ID of the active warehouse named name in
+// projectID. The generic table data API addresses warehouses by UUID, while
+// the Terraform resource names them.
+func (c *Client) LookupWarehouseID(ctx context.Context, projectID, name string) (string, error) {
+	r, err := c.sdk.Warehouses.List(ctx, nil, lakekeeper.WithProject(projectID))
+	if err != nil {
+		return "", wrapErr(err)
+	}
+	for _, w := range r.Warehouses {
+		if w.Name == name && w.Status == managementv1.WAREHOUSESTATUS_ACTIVE {
+			return w.Id, nil
+		}
+	}
+	return "", fmt.Errorf("active warehouse %q not found in project %s", name, projectID)
 }
 
 // DeleteWarehouse deletes a warehouse. With force, the warehouse is deleted
