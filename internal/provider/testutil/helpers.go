@@ -6,8 +6,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/apache/iceberg-go/catalog"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/lakekeeper/terraform-provider-lakekeeper/internal/provider/api"
 )
@@ -75,13 +78,13 @@ func CreateWarehouse(t *testing.T, projectID, keyPrefix string) *api.Warehouse {
 		StorageProfile: &api.S3StorageProfile{
 			Bucket:          "testacc",
 			Region:          "local-01",
-			Endpoint:        new("http://minio:9000/"),
+			Endpoint:        new("http://objectstore:9000/"),
 			PathStyleAccess: new(true),
 			KeyPrefix:       new(keyPrefix),
 		},
 		StorageCredential: &api.S3AccessKeyCredential{
-			AccessKeyID:     "minio-root-user",
-			SecretAccessKey: "minio-root-password",
+			AccessKeyID:     "testacc-access-key",
+			SecretAccessKey: "testacc-secret-key",
 		},
 		DeleteProfile: &api.DeleteProfile{Type: api.DeleteProfileTypeHard},
 	})
@@ -90,9 +93,21 @@ func CreateWarehouse(t *testing.T, projectID, keyPrefix string) *api.Warehouse {
 	}
 
 	t.Cleanup(func() {
-		if err := TestLakekeeperClient.DeleteWarehouse(context.Background(), projectID, warehouseID, true); err != nil {
-			t.Fatalf("could not cleanup test warehouse: %v", err)
+		// Dropping tables, views and generic tables queues purge tasks. A
+		// warehouse cannot be deleted until those finish, so retry briefly
+		// instead of racing the task worker.
+		ctx := context.Background()
+		var err error
+		for attempt := 0; attempt < 30; attempt++ {
+			if err = TestLakekeeperClient.DeleteWarehouse(ctx, projectID, warehouseID, true); err == nil {
+				return
+			}
+			if !strings.Contains(err.Error(), "WarehouseHasUnfinishedTasks") {
+				break
+			}
+			time.Sleep(time.Second)
 		}
+		t.Fatalf("could not cleanup test warehouse: %v", err)
 	})
 
 	warehouse, err := TestLakekeeperClient.GetWarehouse(t.Context(), projectID, warehouseID)
@@ -147,4 +162,46 @@ func CreateUser(t *testing.T, id string) *api.User {
 	})
 
 	return user
+}
+
+// CreateNamespace is a test helper for creating a namespace. Cleanup drops it
+// before the warehouse is removed. Pass several levels to create a nested
+// namespace.
+func CreateNamespace(t *testing.T, projectID string, warehouse *api.Warehouse, path ...string) {
+	t.Helper()
+
+	cat, err := TestLakekeeperClient.Catalog(t.Context(), projectID, warehouse.Name)
+	if err != nil {
+		t.Fatalf("could not create test catalog client: %v", err)
+	}
+
+	if err := cat.CreateNamespace(t.Context(), catalog.ToIdentifier(path...), nil); err != nil {
+		t.Fatalf("could not create test namespace: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := cat.DropNamespace(context.Background(), catalog.ToIdentifier(path...)); err != nil {
+			t.Errorf("could not cleanup test namespace: %v", err)
+		}
+	})
+}
+
+// CreateGenericTable is a test helper for creating a generic table. It returns
+// the generic table's UUID, which the management API uses. Cleanup force-drops
+// it, which also works while it is protected.
+func CreateGenericTable(t *testing.T, projectID string, warehouse *api.Warehouse, namespace []string, name, format string) string {
+	t.Helper()
+
+	id, err := TestLakekeeperClient.CreateGenericTable(t.Context(), projectID, warehouse.ID, namespace, api.GenericTableRequest{Name: name, Format: format})
+	if err != nil {
+		t.Fatalf("could not create test generic table: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := TestLakekeeperClient.DeleteGenericTable(context.Background(), projectID, warehouse.ID, namespace, name, false, true); err != nil {
+			t.Errorf("could not cleanup test generic table: %v", err)
+		}
+	})
+
+	return id.ID
 }
