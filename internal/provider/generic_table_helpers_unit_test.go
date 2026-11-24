@@ -42,3 +42,11 @@ func TestCanonicalJSON(t *testing.T) {
 		t.Fatalf("canonicalJSON = %s, want %s", got, want)
 	}
 }
+
+func TestCanonicalJSONKeepsHTMLCharacters(t *testing.T) {
+	in := []byte(`{"type":"list<float>","doc":"a & b"}`)
+	want := `{"doc":"a & b","type":"list<float>"}`
+	if got := canonicalJSON(in); got != want {
+		t.Fatalf("canonicalJSON = %s, want %s", got, want)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/lakekeeper/terraform-provider-lakekeeper/internal/provider/api"
 	"github.com/lakekeeper/terraform-provider-lakekeeper/internal/provider/testutil"
 )
 
@@ -67,13 +68,12 @@ func TestAccLakekeeperGenericTable_basic(t *testing.T) {
 				ImportStateVerify: true,
 			},
 			{
-				Config: testAccGenericTableConfig(project.ID, warehouse.Name, "gtacc.nested", renamed, "lance", baseLocation, `
-				doc        = "first"
-				properties = { owner = "data" }
-				schema     = jsonencode({ type = "struct", fields = [] })`),
+				// Renaming with base_location omitted must not replace the table.
+				Config: testAccGenericTableConfigWithoutBaseLocation(project.ID, warehouse.Name, "gtacc.nested", renamed, "lance"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "id", internalID(renamed)),
 					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "name", renamed),
+					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "base_location", baseLocation),
 					resource.TestMatchResourceAttr("lakekeeper_generic_table.this", "generic_table_id", uuidPattern),
 				),
 			},
@@ -130,6 +130,168 @@ resource "lakekeeper_generic_table" "this" {
 %s
 }
 `, projectID, warehouseName, namespace, name, format, baseLocation, extra)
+}
+
+func testAccGenericTableConfigWithoutBaseLocation(projectID, warehouseName, namespace, name, format string) string {
+	return fmt.Sprintf(`
+resource "lakekeeper_generic_table" "this" {
+  project_id     = %q
+  warehouse_name = %q
+  namespace      = %q
+  name           = %q
+  format         = %q
+  doc            = "first"
+  properties     = { owner = "data" }
+  schema         = jsonencode({ type = "struct", fields = [] })
+}
+`, projectID, warehouseName, namespace, name, format)
+}
+
+func testAccGenericTableMinimalConfig(projectID, warehouseName, namespace, name, format string) string {
+	return fmt.Sprintf(`
+resource "lakekeeper_generic_table" "this" {
+  project_id     = %q
+  warehouse_name = %q
+  namespace      = %q
+  name           = %q
+  format         = %q
+}
+`, projectID, warehouseName, namespace, name, format)
+}
+
+// TestAccLakekeeperGenericTable_omittedOptionalAttributes creates a table with
+// doc, properties, schema and base_location omitted. The create response must
+// fill them in, or the apply fails with unknown values in state.
+func TestAccLakekeeperGenericTable_omittedOptionalAttributes(t *testing.T) {
+	project := testutil.CreateProject(t)
+
+	keyPrefix := fmt.Sprintf("key-prefix-%d", rand.Int())
+	warehouse := testutil.CreateWarehouse(t, project.ID, keyPrefix)
+	testutil.CreateNamespace(t, project.ID, warehouse, "gtmin")
+
+	name := acctest.RandString(8)
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckLakekeeperGenericTableDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccGenericTableMinimalConfig(project.ID, warehouse.Name, "gtmin", name, "lance"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestMatchResourceAttr("lakekeeper_generic_table.this", "base_location", regexp.MustCompile(`^s3://`)),
+					resource.TestCheckNoResourceAttr("lakekeeper_generic_table.this", "doc"),
+					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "properties.#", "0"),
+					resource.TestCheckNoResourceAttr("lakekeeper_generic_table.this", "schema"),
+				),
+			},
+			{
+				ResourceName:      "lakekeeper_generic_table.this",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccLakekeeperGenericTable_refreshesIDAfterExternalRecreate drops and
+// recreates the table outside Terraform under the same name. The refresh must
+// pick up the new UUID instead of keeping the old one.
+func TestAccLakekeeperGenericTable_refreshesIDAfterExternalRecreate(t *testing.T) {
+	project := testutil.CreateProject(t)
+
+	keyPrefix := fmt.Sprintf("key-prefix-%d", rand.Int())
+	warehouse := testutil.CreateWarehouse(t, project.ID, keyPrefix)
+	testutil.CreateNamespace(t, project.ID, warehouse, "gtrecreate")
+
+	name := acctest.RandString(8)
+	namespace := []string{"gtrecreate"}
+	baseLocation := fmt.Sprintf("s3://testacc/%s/generic-tables/%s", keyPrefix, name)
+	config := testAccGenericTableConfig(project.ID, warehouse.Name, "gtrecreate", name, "lance", baseLocation, "")
+
+	var firstID string
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckLakekeeperGenericTableDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: func(state *terraform.State) error {
+					firstID = state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes["generic_table_id"]
+					ctx := t.Context()
+					if err := testutil.TestLakekeeperClient.DeleteGenericTable(ctx, project.ID, warehouse.ID, namespace, name, false, true); err != nil {
+						return fmt.Errorf("could not drop the table outside Terraform: %w", err)
+					}
+					if _, err := testutil.TestLakekeeperClient.CreateGenericTable(ctx, project.ID, warehouse.ID, namespace, api.GenericTableRequest{
+						Name:         name,
+						Format:       "lance",
+						BaseLocation: &baseLocation,
+					}); err != nil {
+						return fmt.Errorf("could not recreate the table outside Terraform: %w", err)
+					}
+					return nil
+				},
+			},
+			{
+				RefreshState: true,
+				Check: func(state *terraform.State) error {
+					got := state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes["generic_table_id"]
+					if got == firstID {
+						return fmt.Errorf("generic_table_id %q was not refreshed after the table was recreated", got)
+					}
+					want, err := testutil.TestLakekeeperClient.ResolveGenericTableID(t.Context(), project.ID, warehouse.ID, namespace, name)
+					if err != nil {
+						return err
+					}
+					if got != want {
+						return fmt.Errorf("generic_table_id = %q, want %q", got, want)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// TestAccLakekeeperGenericTable_baseLocationTrailingSlash ensures a location
+// written with a trailing slash applies and stays equivalent when the slash is
+// dropped, even though Lakekeeper stores locations without one.
+func TestAccLakekeeperGenericTable_baseLocationTrailingSlash(t *testing.T) {
+	project := testutil.CreateProject(t)
+
+	keyPrefix := fmt.Sprintf("key-prefix-%d", rand.Int())
+	warehouse := testutil.CreateWarehouse(t, project.ID, keyPrefix)
+	testutil.CreateNamespace(t, project.ID, warehouse, "gtslash")
+
+	name := acctest.RandString(8)
+	baseLocation := fmt.Sprintf("s3://testacc/%s/generic-tables/%s", keyPrefix, name)
+
+	var genericTableID string
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckLakekeeperGenericTableDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccGenericTableConfig(project.ID, warehouse.Name, "gtslash", name, "lance", baseLocation+"/", ""),
+				Check: func(state *terraform.State) error {
+					attributes := state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes
+					genericTableID = attributes["generic_table_id"]
+					if got := attributes["base_location"]; got != baseLocation+"/" {
+						return fmt.Errorf("base_location = %q, want %q", got, baseLocation+"/")
+					}
+					return nil
+				},
+			},
+			{
+				Config: testAccGenericTableConfig(project.ID, warehouse.Name, "gtslash", name, "lance", baseLocation, ""),
+				Check: func(state *terraform.State) error {
+					attributes := state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes
+					if got := attributes["generic_table_id"]; got != genericTableID {
+						return fmt.Errorf("generic_table_id changed from %q to %q, the table was replaced", genericTableID, got)
+					}
+					return nil
+				},
+			},
+		},
+	})
 }
 
 func testAccCheckLakekeeperGenericTableDestroy(s *terraform.State) error {

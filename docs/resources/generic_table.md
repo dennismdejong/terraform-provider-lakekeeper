@@ -54,7 +54,7 @@ resource "lakekeeper_generic_table" "embeddings" {
 
 ### Optional
 
-- `base_location` (String) The base location of the table. When omitted, Lakekeeper derives it from the warehouse storage. Changing it replaces the table.
+- `base_location` (String) The base location of the table. When omitted, Lakekeeper derives it from the warehouse storage. Lakekeeper stores locations without trailing slashes; the provider treats a trailing slash as equivalent. Changing it replaces the table.
 - `doc` (String) A free-form description of the table. Changing it replaces the table. On import, omitting it keeps the stored value; set it to an empty string to clear it.
 - `properties` (Map of String) Arbitrary string properties stored with the table. Changing them replaces the table. On import, omitting them keeps the stored values; set them to an empty map to clear them.
 - `purge_on_delete` (Boolean) Whether destroying this resource also deletes the files under the table's base location. Defaults to `false`, so a destroy only removes the catalog entry; set it to `true` to delete the data files as well.
@@ -64,7 +64,7 @@ resource "lakekeeper_generic_table" "embeddings" {
 
 - `generic_table_id` (String) The generic table UUID used by the protection and permission APIs.
 - `id` (String) The ID of the generic table, in the form `{{project_id}}/{{warehouse_name}}/{{namespace}}/{{name}}`.
-- `protected` (Boolean) Whether the table is protected from being dropped. Manage this with `lakekeeper_generic_table_protection`.
+- `protected` (Boolean) Whether the table is protected from being dropped. Lakekeeper refuses to drop a protected table, so remove the protection before destroying this resource.
 - `warehouse_id` (String) The UUID of the warehouse. Use it with the protection and permission APIs.
 
 ## Import

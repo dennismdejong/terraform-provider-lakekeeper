@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/mapplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -126,11 +127,11 @@ func (r *lakekeeperGenericTableResource) Schema(_ context.Context, _ resource.Sc
 				},
 			},
 			"base_location": schema.StringAttribute{
-				MarkdownDescription: "The base location of the table. When omitted, Lakekeeper derives it from the warehouse storage. Changing it replaces the table.",
+				MarkdownDescription: "The base location of the table. When omitted, Lakekeeper derives it from the warehouse storage. Lakekeeper stores locations without trailing slashes; the provider treats a trailing slash as equivalent. Changing it replaces the table.",
 				Optional:            true,
 				Computed:            true,
 				PlanModifiers: []planmodifier.String{
-					keepUnlessChanged{attributes: []string{"project_id", "warehouse_name", "namespace", "name"}},
+					keepUnlessChanged{attributes: []string{"project_id", "warehouse_name", "namespace"}},
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
@@ -164,8 +165,11 @@ func (r *lakekeeperGenericTableResource) Schema(_ context.Context, _ resource.Sc
 				},
 			},
 			"protected": schema.BoolAttribute{
-				MarkdownDescription: "Whether the table is protected from being dropped. Manage this with `lakekeeper_generic_table_protection`.",
+				MarkdownDescription: "Whether the table is protected from being dropped. Lakekeeper refuses to drop a protected table, so remove the protection before destroying this resource.",
 				Computed:            true,
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"generic_table_id": schema.StringAttribute{
 				MarkdownDescription: "The generic table UUID used by the protection and permission APIs.",
@@ -239,19 +243,18 @@ func (r *lakekeeperGenericTableResource) Create(ctx context.Context, req resourc
 		return
 	}
 
-	// doc, properties and schema cannot be updated afterwards, so the plan
-	// remains authoritative for them; the server may omit them from the create
-	// response.
+	// The server may omit doc, properties and schema from the create response
+	// when they are empty, and it derives or normalizes base_location. Copy the
+	// response so no attribute stays unknown once the table exists.
+	if err := setGenericTableMetadata(ctx, &plan, table); err != nil {
+		resp.Diagnostics.AddError("Cannot read created generic table", err.Error())
+		return
+	}
 	plan.ID = types.StringValue(genericTableInternalID(plan.ProjectID.ValueString(), plan.WarehouseName.ValueString(), namespace, plan.Name.ValueString()))
 	if table.ID == "" {
 		plan.GenericTableID = types.StringNull()
 	} else {
 		plan.GenericTableID = types.StringValue(table.ID)
-	}
-	plan.BaseLocation = types.StringValue(table.BaseLocation)
-	plan.Protected = types.BoolValue(table.Protected)
-	if !plan.Schema.IsNull() && !plan.Schema.IsUnknown() {
-		plan.Schema = jsontypes.NewNormalizedValue(canonicalJSON(json.RawMessage(plan.Schema.ValueString())))
 	}
 
 	tflog.Debug(ctx, "created a generic table", map[string]any{"id": plan.ID.ValueString()})
@@ -318,10 +321,16 @@ func (r *lakekeeperGenericTableResource) Update(ctx context.Context, req resourc
 			resp.Diagnostics.AddError("Cannot read generic table", err.Error())
 			return
 		}
-		// The rename succeeded. Keep the new name and its deterministic ID in
-		// state, so the next refresh retries instead of renaming a name that no
-		// longer exists.
-		plan.ID = types.StringValue(genericTableInternalID(plan.ProjectID.ValueString(), plan.WarehouseName.ValueString(), namespace, plan.Name.ValueString()))
+		// The rename succeeded, but the follow-up read failed. Persist the new
+		// name from the prior state, whose other values are still valid, so the
+		// next refresh retries instead of renaming a name that no longer exists.
+		// Starting from state also keeps the State.Set below from receiving
+		// unknowns such as the computed `protected`.
+		fallback := state
+		fallback.Name = plan.Name
+		fallback.WarehouseID = types.StringValue(warehouseID)
+		fallback.ID = types.StringValue(genericTableInternalID(plan.ProjectID.ValueString(), plan.WarehouseName.ValueString(), namespace, plan.Name.ValueString()))
+		plan = fallback
 		resp.Diagnostics.AddWarning("Cannot read renamed generic table", fmt.Sprintf("%v; the new name is recorded and the next refresh will retry", err))
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -362,7 +371,7 @@ func (r *lakekeeperGenericTableResource) Delete(ctx context.Context, req resourc
 		}
 		resp.Diagnostics.AddError(
 			"Cannot drop generic table",
-			fmt.Sprintf("Lakekeeper refused to drop %q. The table may be protected: set `protected = false` on the `lakekeeper_generic_table_protection` resource that covers it and apply, then destroy again. Server response: %v", state.Name.ValueString(), err),
+			fmt.Sprintf("Lakekeeper refused to drop %q. The table may be protected by a Lakekeeper protection rule; remove the protection and apply again. Server response: %v", state.Name.ValueString(), err),
 		)
 		return
 	}
@@ -438,6 +447,15 @@ func configChangesAttribute(ctx context.Context, state *tfsdk.State, config *tfs
 	p := path.Root(attribute)
 
 	switch attribute {
+	case "base_location":
+		var stateValue, configValue types.String
+		if state.GetAttribute(ctx, p, &stateValue).HasError() || config.GetAttribute(ctx, p, &configValue).HasError() {
+			return true
+		}
+		if configValue.IsNull() || configValue.IsUnknown() {
+			return false
+		}
+		return strings.TrimRight(configValue.ValueString(), "/") != strings.TrimRight(stateValue.ValueString(), "/")
 	case "properties":
 		var stateValue, configValue types.Map
 		if state.GetAttribute(ctx, p, &stateValue).HasError() || config.GetAttribute(ctx, p, &configValue).HasError() {
@@ -472,6 +490,45 @@ func configChangesAttribute(ctx context.Context, state *tfsdk.State, config *tfs
 	}
 }
 
+// setGenericTableMetadata copies the table metadata the API returns into model.
+// It also normalizes doc, properties and schema, because the server omits them
+// when they are empty and returns an empty properties map as no map at all.
+func setGenericTableMetadata(ctx context.Context, model *lakekeeperGenericTableResourceModel, table *api.GenericTable) error {
+	model.Name = types.StringValue(table.Name)
+	model.Format = types.StringValue(table.Format)
+	// Lakekeeper stores locations without trailing slashes. Keep the prior
+	// value when it differs only in trailing slashes, so a configured location
+	// does not change on every refresh and a create keeps the planned value.
+	if model.BaseLocation.IsNull() || model.BaseLocation.IsUnknown() ||
+		strings.TrimRight(model.BaseLocation.ValueString(), "/") != strings.TrimRight(table.BaseLocation, "/") {
+		model.BaseLocation = types.StringValue(table.BaseLocation)
+	}
+	model.Protected = types.BoolValue(table.Protected)
+
+	if table.Doc == nil {
+		model.Doc = types.StringNull()
+	} else {
+		model.Doc = types.StringValue(*table.Doc)
+	}
+	if table.Properties == nil {
+		// Lakekeeper returns no properties for an empty map. Report an empty
+		// map so a configured `properties = {}` does not plan a replacement.
+		model.Properties = types.MapValueMust(types.StringType, map[string]attr.Value{})
+	} else {
+		properties, diags := types.MapValueFrom(ctx, types.StringType, table.Properties)
+		if diags.HasError() {
+			return fmt.Errorf("could not convert table properties: %v", diags)
+		}
+		model.Properties = properties
+	}
+	if table.Schema == nil {
+		model.Schema = jsontypes.NewNormalizedNull()
+	} else {
+		model.Schema = jsontypes.NewNormalizedValue(canonicalJSON(table.Schema))
+	}
+	return nil
+}
+
 // refreshGenericTable loads the table and its UUID and writes both into state.
 func (r *lakekeeperGenericTableResource) refreshGenericTable(ctx context.Context, state *lakekeeperGenericTableResourceModel) error {
 	namespace, err := splitNamespacePath(state.Namespace.ValueString())
@@ -496,42 +553,24 @@ func (r *lakekeeperGenericTableResource) refreshGenericTable(ctx context.Context
 		return fmt.Errorf("catalog returned table %q instead of %q", table.Name, state.Name.ValueString())
 	}
 
-	genericTableID := state.GenericTableID.ValueString()
-	if genericTableID == "" {
-		genericTableID, err = r.client.ResolveGenericTableID(ctx, state.ProjectID.ValueString(), warehouseID, namespace, table.Name)
-		if err != nil {
+	// Load responses carry no UUID, so resolve it from the listing. Resolving
+	// on every refresh notices a table dropped and recreated outside Terraform,
+	// which keeps the old UUID otherwise. If the listing is temporarily
+	// unavailable, a UUID already in state is better than failing the read.
+	genericTableID, err := r.client.ResolveGenericTableID(ctx, state.ProjectID.ValueString(), warehouseID, namespace, table.Name)
+	if err != nil {
+		if state.GenericTableID.ValueString() == "" {
 			return err
 		}
+	} else {
+		state.GenericTableID = types.StringValue(genericTableID)
 	}
 
-	state.Name = types.StringValue(table.Name)
-	state.Format = types.StringValue(table.Format)
-	state.BaseLocation = types.StringValue(table.BaseLocation)
-	state.Protected = types.BoolValue(table.Protected)
-	state.GenericTableID = types.StringValue(genericTableID)
+	if err := setGenericTableMetadata(ctx, state, table); err != nil {
+		return err
+	}
 	state.ID = types.StringValue(genericTableInternalID(state.ProjectID.ValueString(), state.WarehouseName.ValueString(), namespace, table.Name))
 
-	if table.Doc == nil {
-		state.Doc = types.StringNull()
-	} else {
-		state.Doc = types.StringValue(*table.Doc)
-	}
-	if table.Properties == nil {
-		// Lakekeeper returns no properties for an empty map. Report an empty
-		// map so a configured `properties = {}` does not plan a replacement.
-		state.Properties = types.MapValueMust(types.StringType, map[string]attr.Value{})
-	} else {
-		properties, diags := types.MapValueFrom(ctx, types.StringType, table.Properties)
-		if diags.HasError() {
-			return fmt.Errorf("could not convert table properties: %v", diags)
-		}
-		state.Properties = properties
-	}
-	if table.Schema == nil {
-		state.Schema = jsontypes.NewNormalizedNull()
-	} else {
-		state.Schema = jsontypes.NewNormalizedValue(canonicalJSON(table.Schema))
-	}
 	if state.PurgeOnDelete.IsNull() || state.PurgeOnDelete.IsUnknown() {
 		state.PurgeOnDelete = types.BoolValue(false)
 	}
@@ -548,9 +587,13 @@ func canonicalJSON(raw json.RawMessage) string {
 	if err := decoder.Decode(&v); err != nil {
 		return string(raw)
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	// Keep <, > and & as written: the default HTML escaping would turn a schema
+	// such as `list<float>` into `list\u003cfloat\u003e`.
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(v); err != nil {
 		return string(raw)
 	}
-	return string(b)
+	return strings.TrimSuffix(buf.String(), "\n")
 }
