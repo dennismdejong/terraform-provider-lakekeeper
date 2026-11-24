@@ -131,8 +131,8 @@ func (r *lakekeeperGenericTableResource) Schema(_ context.Context, _ resource.Sc
 				Optional:            true,
 				Computed:            true,
 				PlanModifiers: []planmodifier.String{
-					keepUnlessChanged{attributes: []string{"project_id", "warehouse_name", "namespace"}},
-					stringplanmodifier.RequiresReplace(),
+					keepBaseLocation{},
+					stringplanmodifier.RequiresReplaceIf(locationReplaced, "Replaces the table when the base location changes", "Replaces the table when the base location changes, ignoring trailing slashes."),
 				},
 			},
 			"doc": schema.StringAttribute{
@@ -412,6 +412,45 @@ func splitGenericTableImportID(id string) []string {
 	return strings.Split(id, "/")
 }
 
+// keepBaseLocation keeps the prior location when the configuration omits it
+// and leaves a configured location as it is written, so Terraform never plans a
+// value that differs from the configuration. When an attribute that determines
+// the derived location changes, the value is left unknown instead, so a new
+// table gets a location derived from the new namespace or warehouse.
+type keepBaseLocation struct{}
+
+func (keepBaseLocation) Description(_ context.Context) string {
+	return "Keeps the prior location when it is omitted."
+}
+
+func (keepBaseLocation) MarkdownDescription(_ context.Context) string {
+	return "Keeps the prior location when it is omitted."
+}
+
+func (keepBaseLocation) PlanModifyString(ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+	if req.State.Raw.IsNull() {
+		return
+	}
+	for _, attribute := range []string{"project_id", "warehouse_name", "namespace"} {
+		if configChangesAttribute(ctx, &req.State, &req.Config, attribute) {
+			return
+		}
+	}
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		resp.PlanValue = req.StateValue
+	}
+}
+
+// locationReplaced reports whether the base location changed, ignoring trailing
+// slashes because Lakekeeper stores locations without them.
+func locationReplaced(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+	resp.RequiresReplace = !sameLocation(req.PlanValue.ValueString(), req.StateValue.ValueString())
+}
+
+func sameLocation(a, b string) bool {
+	return strings.TrimRight(a, "/") == strings.TrimRight(b, "/")
+}
+
 // keepUnlessChanged keeps a computed value across plans while every attribute
 // it depends on stays as configured. When one of them changes, the value is
 // left unknown so the plan shows that a replacement will produce a new one.
@@ -455,7 +494,7 @@ func configChangesAttribute(ctx context.Context, state *tfsdk.State, config *tfs
 		if configValue.IsNull() || configValue.IsUnknown() {
 			return false
 		}
-		return strings.TrimRight(configValue.ValueString(), "/") != strings.TrimRight(stateValue.ValueString(), "/")
+		return !sameLocation(configValue.ValueString(), stateValue.ValueString())
 	case "properties":
 		var stateValue, configValue types.Map
 		if state.GetAttribute(ctx, p, &stateValue).HasError() || config.GetAttribute(ctx, p, &configValue).HasError() {

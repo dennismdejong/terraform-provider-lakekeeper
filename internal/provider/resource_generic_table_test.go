@@ -30,6 +30,7 @@ func TestAccLakekeeperGenericTable_basic(t *testing.T) {
 	rName := acctest.RandString(8)
 	renamed := acctest.RandString(8)
 	baseLocation := fmt.Sprintf("s3://testacc/%s/generic-tables/%s", keyPrefix, rName)
+	changedBaseLocation := baseLocation + "-changed"
 	replacementBaseLocation := baseLocation + "-delta"
 	movedBaseLocation := baseLocation + "-moved"
 	uuidPattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -81,6 +82,18 @@ func TestAccLakekeeperGenericTable_basic(t *testing.T) {
 				ResourceName:      "lakekeeper_generic_table.this",
 				ImportState:       true,
 				ImportStateVerify: true,
+			},
+			{
+				// Changing only base_location must replace the table.
+				Config: testAccGenericTableConfig(project.ID, warehouse.Name, "gtacc.nested", renamed, "lance", changedBaseLocation, `
+				doc        = "first"
+				properties = { owner = "data" }
+				schema     = jsonencode({ type = "struct", fields = [] })`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "base_location", changedBaseLocation),
+					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "id", internalID(renamed)),
+					resource.TestMatchResourceAttr("lakekeeper_generic_table.this", "generic_table_id", uuidPattern),
+				),
 			},
 			{
 				Config: testAccGenericTableConfig(project.ID, warehouse.Name, "gtacc.nested", renamed, "delta", replacementBaseLocation, `
@@ -168,8 +181,10 @@ func TestAccLakekeeperGenericTable_omittedOptionalAttributes(t *testing.T) {
 	keyPrefix := fmt.Sprintf("key-prefix-%d", rand.Int())
 	warehouse := testutil.CreateWarehouse(t, project.ID, keyPrefix)
 	testutil.CreateNamespace(t, project.ID, warehouse, "gtmin")
+	testutil.CreateNamespace(t, project.ID, warehouse, "gtmin", "other")
 
 	name := acctest.RandString(8)
+	var firstLocation string
 	resource.ParallelTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckLakekeeperGenericTableDestroy,
@@ -181,12 +196,30 @@ func TestAccLakekeeperGenericTable_omittedOptionalAttributes(t *testing.T) {
 					resource.TestCheckNoResourceAttr("lakekeeper_generic_table.this", "doc"),
 					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "properties.#", "0"),
 					resource.TestCheckNoResourceAttr("lakekeeper_generic_table.this", "schema"),
+					func(state *terraform.State) error {
+						firstLocation = state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes["base_location"]
+						return nil
+					},
 				),
 			},
 			{
 				ResourceName:      "lakekeeper_generic_table.this",
 				ImportState:       true,
 				ImportStateVerify: true,
+			},
+			{
+				// The omitted base_location must be derived again for the new namespace.
+				Config: testAccGenericTableMinimalConfig(project.ID, warehouse.Name, "gtmin.other", name, "lance"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("lakekeeper_generic_table.this", "namespace", "gtmin.other"),
+					func(state *terraform.State) error {
+						got := state.RootModule().Resources["lakekeeper_generic_table.this"].Primary.Attributes["base_location"]
+						if got == firstLocation {
+							return fmt.Errorf("base_location stayed %q after the namespace changed", got)
+						}
+						return nil
+					},
+				),
 			},
 		},
 	})
